@@ -59,7 +59,7 @@ struct NodeRecord {
     nested_list: Vec<NodeRecord>,
 }
 
-fn parse_node_record(reader: &mut BufReader<File>) -> Option<NodeRecord> {
+fn parse_node_record(reader: &mut BufReader<File>, indent: usize) -> Option<NodeRecord> {
     let end_offset = LittleEndian::read_u32(&read_bytes(reader, 4));
     let num_properties = LittleEndian::read_u32(&read_bytes(reader, 4));
     let property_list_len = LittleEndian::read_u32(&read_bytes(reader, 4));
@@ -73,7 +73,8 @@ fn parse_node_record(reader: &mut BufReader<File>) -> Option<NodeRecord> {
     let mut name_buf = vec![0u8; name_len as usize];
     reader.read_exact(&mut name_buf);
     let name = String::from_utf8(name_buf).unwrap();
-    println!("=> {}", name);
+    let indent_chars = vec!['-' as u8; indent];
+    println!("{}{}", String::from_utf8(indent_chars).unwrap(), name);
 
     if name.eq("ReferenceTime") {
         let f = 232;
@@ -160,13 +161,11 @@ fn parse_node_record(reader: &mut BufReader<File>) -> Option<NodeRecord> {
 
     let mut subnodes = Vec::new();
     loop {
-        match parse_node_record(reader) {
+        match parse_node_record(reader, indent + 1) {
             Some(node) => subnodes.push(node),
             None => break,
         }
     }
-
-    println!("<= {}", name);
 
     Some(NodeRecord {
         properties,
@@ -217,7 +216,7 @@ fn main() {
     let mut header = [0u8; 27];
     reader.read_exact(&mut header);
 
-    let node = parse_node_record(&mut reader);
+    let node = parse_node_record(&mut reader, 0);
 
 
     println!("Hello, world!");
