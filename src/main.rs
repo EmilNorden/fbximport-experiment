@@ -1,6 +1,9 @@
 use std::fs::File;
 use std::io::{BufReader, Read, SeekFrom, Seek, Cursor};
 use byteorder::{LittleEndian, ByteOrder, BigEndian, ReadBytesExt};
+use nom::error::{VerboseError, context};
+use nom::IResult;
+use nom::bytes::complete::tag;
 
 fn read_boolean(reader: &mut BufReader<File>) -> bool {
     reader.read_u8().unwrap() == 0b00000001
@@ -57,6 +60,28 @@ struct NodeRecord {
     name: String,
     properties: Vec<PropertyRecordType>,
     nested_list: Vec<NodeRecord>,
+}
+
+struct Header<'a> {
+    magic_string: &'a str,
+    unknown_bytes: [u8; 2],
+    version: u32,
+}
+
+type Res<T, U> = IResult<T, U, VerboseError<T>>;
+
+fn magic_string(data: &[u8]) -> Res<&[u8], &str> {
+    context(
+        "header",
+        tag("Kaydara FBX Binary  \0")
+    )(data).map(|(next_input, res)| (next_input, std::str::from_utf8(res).unwrap()))
+}
+
+fn header(data: &[u8]) -> Res<&[u8], Header> {
+    context(
+        "header",
+        
+    )
 }
 
 fn parse_node_record(reader: &mut BufReader<File>, indent: usize) -> Option<NodeRecord> {
@@ -201,10 +226,13 @@ fn read_array_data(reader: &mut BufReader<File>, element_size: usize) -> Cursor<
 }
 
 fn main() {
-    let file = File::open("/Users/emil/Downloads/untitled.fbx")
+    let mut file = File::open("/Users/emil/Downloads/untitled.fbx")
         .expect("Could not open file");
 
-    let mut reader = BufReader::new(file);
+    // let mut reader = BufReader::new(file);
+    let mut data = vec![];
+    file.read_to_end(&mut data);
+    let foo = magic_string(&data);
     /*let mut header: [u8; 20] = [0; 20];
     reader.read_exact(&mut header);
     let headerstr = String::from_utf8(header.to_vec()).unwrap();
@@ -213,11 +241,11 @@ fn main() {
     // reader.seek(SeekFrom::Current(2)); // Skip past two unknown bytes (0x1A and 0x00)
     let version = LittleEndian::read_u32(&read32(&mut reader));*/
 
-    let mut header = [0u8; 27];
+    /*let mut header = [0u8; 27];
     reader.read_exact(&mut header);
 
     let node = parse_node_record(&mut reader, 0);
-
+*/
 
     println!("Hello, world!");
 }
