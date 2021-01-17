@@ -1,9 +1,11 @@
 #![feature(seek_convenience)]
+#![feature(bufreader_seek_relative)]
 
 use std::fs::File;
 use std::io::{Read, BufReader, Seek, Error};
 use byteorder::{ReadBytesExt, LittleEndian};
 use std::str::Utf8Error;
+use nom::lib::std::string::FromUtf8Error;
 
 enum PropertyRecordType {
     SignedInt16(i16),
@@ -32,25 +34,31 @@ struct Header {
 }
 
 #[derive(Debug)]
-enum ParseError<'a> {
-    ValidationError(&'a str),
+enum ParseError {
+    ValidationError(String),
     FormatError,
     IOError(Error)
 }
 
-impl From<std::io::Error> for ParseError<'_> {
+impl From<std::io::Error> for ParseError {
     fn from(e: Error) -> Self {
         ParseError::IOError(e)
     }
 }
 
-impl From<Utf8Error> for ParseError<'_> {
-    fn from(e: Utf8Error) -> Self {
+impl From<Utf8Error> for ParseError {
+    fn from(_: Utf8Error) -> Self {
         ParseError::FormatError
     }
 }
 
-type ParseResult<'a, T> = Result<T, ParseError<'a>>;
+impl From<FromUtf8Error> for ParseError {
+    fn from(_: FromUtf8Error) -> Self {
+        ParseError::FormatError
+    }
+}
+
+type ParseResult<'a, T> = Result<T, ParseError>;
 
 fn parse_i16_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
 {
@@ -117,7 +125,7 @@ fn parse_f32_array_property(reader: &mut BufReader<File>) -> ParseResult<Propert
         Ok(PropertyRecordType::FloatArray(array))
     } else {
         let mut deflated_data = vec![0u8; metadata.compressed_length as usize];
-        reader.read_exact(&mut deflated_data);
+        reader.read_exact(&mut deflated_data)?;
         let enflated_data = inflate::inflate_bytes_zlib(&deflated_data).unwrap();
         let length = enflated_data.len() / std::mem::size_of::<f32>();
 
@@ -141,7 +149,7 @@ fn parse_f64_array_property(reader: &mut BufReader<File>) -> ParseResult<Propert
         Ok(PropertyRecordType::DoubleArray(array))
     } else {
         let mut deflated_data = vec![0u8; metadata.compressed_length as usize];
-        reader.read_exact(&mut deflated_data);
+        reader.read_exact(&mut deflated_data)?;
         let enflated_data = inflate::inflate_bytes_zlib(&deflated_data).unwrap();
         let length = enflated_data.len() / std::mem::size_of::<f64>();
 
@@ -165,7 +173,7 @@ fn parse_i64_array_property(reader: &mut BufReader<File>) -> ParseResult<Propert
         Ok(PropertyRecordType::SignedInt64Array(array))
     } else {
         let mut deflated_data = vec![0u8; metadata.compressed_length as usize];
-        reader.read_exact(&mut deflated_data);
+        reader.read_exact(&mut deflated_data)?;
         let enflated_data = inflate::inflate_bytes_zlib(&deflated_data).unwrap();
         let length = enflated_data.len() / std::mem::size_of::<i64>();
 
@@ -189,7 +197,7 @@ fn parse_i32_array_property(reader: &mut BufReader<File>) -> ParseResult<Propert
         Ok(PropertyRecordType::SignedInt32Array(array))
     } else {
         let mut deflated_data = vec![0u8; metadata.compressed_length as usize];
-        reader.read_exact(&mut deflated_data);
+        reader.read_exact(&mut deflated_data)?;
         let enflated_data = inflate::inflate_bytes_zlib(&deflated_data).unwrap();
         let length = enflated_data.len() / std::mem::size_of::<i32>();
 
@@ -207,11 +215,11 @@ fn parse_bool_array_property(reader: &mut BufReader<File>) -> ParseResult<Proper
     let metadata = parse_array_metadata(reader)?;
     if metadata.encoding == 0 {
         let mut array = vec![0u8; metadata.length as usize];
-        reader.read_exact(&mut array);
+        reader.read_exact(&mut array)?;
         Ok(PropertyRecordType::BooleanArray(array.iter().map(|x| *x == 1).collect()))
     } else {
         let mut deflated_data = vec![0u8; metadata.compressed_length as usize];
-        reader.read_exact(&mut deflated_data);
+        reader.read_exact(&mut deflated_data)?;
         let enflated_data = inflate::inflate_bytes_zlib(&deflated_data).unwrap();
         let length = enflated_data.len() / std::mem::size_of::<i32>();
 
@@ -227,7 +235,7 @@ fn parse_bool_array_property(reader: &mut BufReader<File>) -> ParseResult<Proper
 fn parse_string_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType> {
     let length = reader.read_u32::<LittleEndian>()? as usize;
     let mut bytes = vec![0u8; length];
-    reader.read_exact(&mut bytes);
+    reader.read_exact(&mut bytes)?;
 
     Ok(PropertyRecordType::String(String::from_utf8(Vec::from(bytes)).unwrap()))
 }
@@ -235,7 +243,7 @@ fn parse_string_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRe
 fn parse_binary_data_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType> {
     let length = reader.read_u32::<LittleEndian>()? as usize;
     let mut bytes = vec![0u8; length];
-    reader.read_exact(&mut bytes);
+    reader.read_exact(&mut bytes)?;
     Ok(PropertyRecordType::BinaryData(bytes))
 }
 
@@ -272,19 +280,15 @@ fn parse_properties(reader: &mut BufReader<File>, num_properties: usize) -> Pars
     Ok(result)
 }
 
-fn parse_string(reader: &mut BufReader<File>) -> ParseResult<&str> {
+fn parse_string(reader: &mut BufReader<File>) -> ParseResult<String> {
     let length = reader.read_u8()? as usize;
     let mut string_bytes = vec![0u8; length];
-    reader.read_exact(&mut string_bytes);
+    reader.read_exact(&mut string_bytes)?;
 
-    let foo = std::str::from_utf8(&string_bytes);
-    if foo.is_err() {
-        let ff = 23232;
-    }
-    Ok(foo.unwrap())
+    Ok(String::from_utf8(string_bytes)?)
 }
 
-fn parse_node(reader: &mut BufReader<File>, start_offset: usize, file_length: usize) -> ParseResult<Option<NodeRecord>> {
+fn parse_node(reader: &mut BufReader<File>, file_length: usize) -> ParseResult<Option<NodeRecord>> {
     let end_offset = reader.read_u32::<LittleEndian>()? as usize;
     if end_offset == 0 {
         // End of file
@@ -292,33 +296,22 @@ fn parse_node(reader: &mut BufReader<File>, start_offset: usize, file_length: us
     }
 
     if end_offset >= file_length {
-        return Err(ParseError::ValidationError("end offset is outside bounds"));
+        return Err(ParseError::ValidationError("end offset is outside bounds".to_string()));
     }
 
     let num_properties = reader.read_u32::<LittleEndian>()?;
     let property_length_bytes = reader.read_u32::<LittleEndian>()?;
     let name = parse_string(reader)?;
 
-    if name == "Geometry" {
-        let sdss = 22;
-    }
-    if name == "Vertices" {
-        let sss = 22;
-    }
-
-    if name == "Model" {
-        let sssss = 123;
-    }
-
     let property_start_offset = reader.stream_position()? as usize;
     if property_start_offset + property_length_bytes as usize > file_length {
-        return Err(ParseError::ValidationError("property length out of bounds"));
+        return Err(ParseError::ValidationError("property length out of bounds".to_string()));
     }
 
     let properties = parse_properties(reader,num_properties as usize)?;
 
     if property_length_bytes as usize != reader.stream_position()? as usize - property_start_offset {
-        return Err(ParseError::ValidationError("did not read correct amount of bytes when parsing properties"));
+        return Err(ParseError::ValidationError("did not read correct amount of bytes when parsing properties".to_string()));
     }
 
     let mut child_nodes = Vec::new();
@@ -326,27 +319,27 @@ fn parse_node(reader: &mut BufReader<File>, start_offset: usize, file_length: us
         let remaining_byte_count = end_offset - reader.stream_position()? as usize;
         let sentinel_block_length = std::mem::size_of::<u32>() * 3 + 1;
         if remaining_byte_count < sentinel_block_length {
-            return Err(ParseError::ValidationError("insufficient amount of bytes at end of node"))
+            return Err(ParseError::ValidationError("insufficient amount of bytes at end of node".to_string()))
         }
 
         while (reader.stream_position()? as usize) < end_offset - sentinel_block_length {
-            let node = parse_node(reader, start_offset, file_length)?;
+            let node = parse_node(reader, file_length)?;
             if node.is_some() {
                 child_nodes.push(node.expect("Null node?"));
             }
         }
 
         let mut sentinel_block = vec![0u8; sentinel_block_length];
-        reader.read_exact(&mut sentinel_block);
+        reader.read_exact(&mut sentinel_block)?;
         for i in 0..sentinel_block_length {
             if sentinel_block[i] != 0 {
-                return Err(ParseError::ValidationError("sentinel block contains non-zero values"));
+                return Err(ParseError::ValidationError("sentinel block contains non-zero values".to_string()));
             }
         }
     }
 
     if reader.stream_position()? as usize != end_offset {
-        return Err(ParseError::ValidationError("end offset not reached."));
+        return Err(ParseError::ValidationError("end offset not reached.".to_string()));
     }
 
     Ok(Some(NodeRecord {
@@ -356,22 +349,15 @@ fn parse_node(reader: &mut BufReader<File>, start_offset: usize, file_length: us
     }))
 }
 
-fn get_offset(start_offset: usize, end_offset: &[u8]) -> usize {
-    end_offset.as_ptr() as usize - start_offset
-}
-
-
 fn header(reader: &mut BufReader<File>) -> ParseResult<Header> {
-    let mut magic_string = vec![0u8; 21];
-    reader.read_exact(&mut magic_string);
-
-    if std::str::from_utf8(&magic_string)? != "Kaydara FBX Binary  " {
-        return Err(ParseError::ValidationError("file header magic string is incorrect"))
+    let mut magic_string_bytes = vec![0u8; 21];
+    reader.read_exact(&mut magic_string_bytes)?;
+    if std::str::from_utf8(&magic_string_bytes)? != "Kaydara FBX Binary  \0" {
+        return Err(ParseError::ValidationError("file header magic string is incorrect".to_string()))
     }
 
-    // read and throw away two bytes
-    reader.read_u8();
-    reader.read_u8();
+    // Skip past unknown bytes
+    reader.seek_relative(2)?;
 
     let version = reader.read_u32::<LittleEndian>()?;
 
@@ -387,13 +373,13 @@ fn print_property(prop: &PropertyRecordType, indent: usize) {
         PropertyRecordType::Float(x) => { println!("f32: {}", x); }
         PropertyRecordType::Double(x) => { println!("f64: {}", x); }
         PropertyRecordType::SignedInt64(x) => { println!("i64: {}", x); }
-        PropertyRecordType::FloatArray(x) => { println!("[f32]"); }
-        PropertyRecordType::DoubleArray(x) => { println!("[f64]"); }
-        PropertyRecordType::SignedInt64Array(x) => { println!("[i64]"); }
-        PropertyRecordType::SignedInt32Array(x) => { println!("[i32]"); }
-        PropertyRecordType::BooleanArray(x) => { println!("[bool]"); }
+        PropertyRecordType::FloatArray(_) => { println!("[f32]"); }
+        PropertyRecordType::DoubleArray(_) => { println!("[f64]"); }
+        PropertyRecordType::SignedInt64Array(_) => { println!("[i64]"); }
+        PropertyRecordType::SignedInt32Array(_) => { println!("[i32]"); }
+        PropertyRecordType::BooleanArray(_) => { println!("[bool]"); }
         PropertyRecordType::String(x) => { println!("str: {}", x); }
-        PropertyRecordType::BinaryData(x) => { println!("raw"); }
+        PropertyRecordType::BinaryData(_) => { println!("raw"); }
     }
 }
 
@@ -409,12 +395,13 @@ fn print_node(node: &NodeRecord, indent: usize) {
     }
 }
 
-fn parse_nodes(reader: &mut BufReader<File>, start_offset: usize, file_length: usize) -> ParseResult<Vec<NodeRecord>> {
+fn parse_nodes(reader: &mut BufReader<File>, file_length: usize) -> ParseResult<Vec<NodeRecord>> {
     let mut result = Vec::new();
+
     while (reader.stream_position()? as usize) < file_length {
-        let root = parse_node(reader, start_offset, file_length)?;
-        if root.is_some() {
-            result.push(root.unwrap());
+        match parse_node(reader, file_length)? {
+            Some(node) => result.push(node),
+            None => break
         }
     }
 
@@ -422,17 +409,16 @@ fn parse_nodes(reader: &mut BufReader<File>, start_offset: usize, file_length: u
 }
 
 fn main() {
-    let mut file = File::open("/Users/emil/Downloads/untitled.fbx")
+    let file = File::open("/Users/emil/Downloads/untitled.fbx")
         .expect("Could not open file");
 
     let mut reader = BufReader::new(file);
     let length = reader.stream_len().unwrap() as usize;
-    let header = header(&mut reader).unwrap();
+    let _header = header(&mut reader).unwrap();
 
     let nodes =
         parse_nodes(
             &mut reader,
-            0,
             length).unwrap();
 
     for node in &nodes {
