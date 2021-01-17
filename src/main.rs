@@ -1,13 +1,9 @@
+#![feature(seek_convenience)]
+
 use std::fs::File;
-use std::io::{Read};
-use nom::error::{VerboseError, context};
-use nom::{IResult, ToUsize, Offset};
-use nom::bytes::complete::{tag, take};
-use nom::number::complete::{le_u32, le_u8, le_i32, le_i16, le_f32, le_f64, le_i64};
-use nom::sequence::tuple;
-use nom::Err::Error;
-use nom::multi::{count, length_data};
+use std::io::{Read, BufReader, Seek, Error};
 use byteorder::{ReadBytesExt, LittleEndian};
+use std::str::Utf8Error;
 
 enum PropertyRecordType {
     SignedInt16(i16),
@@ -26,56 +22,70 @@ enum PropertyRecordType {
 }
 
 struct NodeRecord {
-    end_offset: u32,
-    num_properties: u32,
-    property_list_len: u32,
     name: String,
     properties: Vec<PropertyRecordType>,
     nested_list: Vec<NodeRecord>,
 }
 
-struct Header<'a> {
-    magic_string: &'a str,
-    unknown_bytes: [u8; 2],
+struct Header {
     version: u32,
 }
 
-type Res<T, U> = IResult<T, U, VerboseError<T>>;
-
-fn parse_i16_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
-{
-    let (input, value) = le_i16(data)?;
-    Ok((input, PropertyRecordType::SignedInt16(value)))
+#[derive(Debug)]
+enum ParseError<'a> {
+    ValidationError(&'a str),
+    FormatError,
+    IOError(Error)
 }
 
-fn parse_i32_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
-{
-    let (input, value) = le_i32(data)?;
-    Ok((input, PropertyRecordType::SignedInt32(value)))
+impl From<std::io::Error> for ParseError<'_> {
+    fn from(e: Error) -> Self {
+        ParseError::IOError(e)
+    }
 }
 
-fn parse_i64_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
-{
-    let (input, value) = le_i64(data)?;
-    Ok((input, PropertyRecordType::SignedInt64(value)))
+impl From<Utf8Error> for ParseError<'_> {
+    fn from(e: Utf8Error) -> Self {
+        ParseError::FormatError
+    }
 }
 
-fn parse_f32_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
+type ParseResult<'a, T> = Result<T, ParseError<'a>>;
+
+fn parse_i16_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
 {
-    let (input, value) = le_f32(data)?;
-    Ok((input, PropertyRecordType::Float(value)))
+    let value = reader.read_i16::<LittleEndian>()?;
+    Ok(PropertyRecordType::SignedInt16(value))
 }
 
-fn parse_f64_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
+fn parse_i32_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
 {
-    let (input, value) = le_f64(data)?;
-    Ok((input, PropertyRecordType::Double(value)))
+    let value = reader.read_i32::<LittleEndian>()?;
+    Ok(PropertyRecordType::SignedInt32(value))
 }
 
-fn parse_bool_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
+fn parse_i64_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
 {
-    let (input, value) = le_u8(data)?;
-    Ok((input, PropertyRecordType::Boolean(value == 1)))
+    let value = reader.read_i64::<LittleEndian>()?;
+    Ok(PropertyRecordType::SignedInt64(value))
+}
+
+fn parse_f32_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
+{
+    let value = reader.read_f32::<LittleEndian>()?;
+    Ok(PropertyRecordType::Float(value))
+}
+
+fn parse_f64_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
+{
+    let value = reader.read_f64::<LittleEndian>()?;
+    Ok(PropertyRecordType::Double(value))
+}
+
+fn parse_bool_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
+{
+    let value = reader.read_u8()?;
+    Ok(PropertyRecordType::Boolean(value == 1))
 }
 
 struct ArrayMetaData {
@@ -84,26 +94,31 @@ struct ArrayMetaData {
     compressed_length: u32,
 }
 
-fn parse_array_metadata(data: &[u8]) -> Res<&[u8], ArrayMetaData> {
-    tuple((le_u32, le_u32, le_u32))(data)
-        .map(|(new_input, (length, encoding, compressed_length))| (new_input,
-                                                                   ArrayMetaData {
-                                                                       length,
-                                                                       encoding,
-                                                                       compressed_length,
-                                                                   }))
+fn parse_array_metadata(reader: &mut BufReader<File>) -> ParseResult<ArrayMetaData> {
+    let length = reader.read_u32::<LittleEndian>()?;
+    let encoding = reader.read_u32::<LittleEndian>()?;
+    let compressed_length = reader.read_u32::<LittleEndian>()?;
+
+    Ok(ArrayMetaData {
+        length,
+        encoding,
+        compressed_length
+    })
 }
 
-fn parse_f32_array_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
+fn parse_f32_array_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
 {
-    let (input, metadata) = parse_array_metadata(data)?;
+    let metadata = parse_array_metadata(reader)?;
     if metadata.encoding == 0 {
-        let (input, array) = count(le_f32, metadata.length as usize)(input)?;
-        Ok((input, PropertyRecordType::FloatArray(array)))
-    }
-    else {
-        let (input, deflated_data) = take(metadata.compressed_length)(input)?;
-        let enflated_data = inflate::inflate_bytes_zlib(deflated_data).unwrap();
+        let mut array = vec![0f32; metadata.length as usize];
+        for _ in 0..metadata.length {
+            array.push(reader.read_f32::<LittleEndian>()?);
+        }
+        Ok(PropertyRecordType::FloatArray(array))
+    } else {
+        let mut deflated_data = vec![0u8; metadata.compressed_length as usize];
+        reader.read_exact(&mut deflated_data);
+        let enflated_data = inflate::inflate_bytes_zlib(&deflated_data).unwrap();
         let length = enflated_data.len() / std::mem::size_of::<f32>();
 
         let mut array = Vec::with_capacity(length);
@@ -111,20 +126,23 @@ fn parse_f32_array_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
             array.push(enflated_data.as_slice().read_f32::<LittleEndian>().unwrap());
         }
 
-        Ok((input, PropertyRecordType::FloatArray(array)))
+        Ok(PropertyRecordType::FloatArray(array))
     }
 }
 
-fn parse_f64_array_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
+fn parse_f64_array_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
 {
-    let (input, metadata) = parse_array_metadata(data)?;
+    let metadata = parse_array_metadata(reader)?;
     if metadata.encoding == 0 {
-        let (input, array) = count(le_f64, metadata.length as usize)(input)?;
-        Ok((input, PropertyRecordType::DoubleArray(array)))
-    }
-    else {
-        let (input, deflated_data) = take(metadata.compressed_length)(input)?;
-        let enflated_data = inflate::inflate_bytes_zlib(deflated_data).unwrap();
+        let mut array = vec![0f64; metadata.length as usize];
+        for _ in 0..metadata.length {
+            array.push(reader.read_f64::<LittleEndian>()?);
+        }
+        Ok(PropertyRecordType::DoubleArray(array))
+    } else {
+        let mut deflated_data = vec![0u8; metadata.compressed_length as usize];
+        reader.read_exact(&mut deflated_data);
+        let enflated_data = inflate::inflate_bytes_zlib(&deflated_data).unwrap();
         let length = enflated_data.len() / std::mem::size_of::<f64>();
 
         let mut array = Vec::with_capacity(length);
@@ -132,20 +150,23 @@ fn parse_f64_array_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
             array.push(enflated_data.as_slice().read_f64::<LittleEndian>().unwrap());
         }
 
-        Ok((input, PropertyRecordType::DoubleArray(array)))
+        Ok(PropertyRecordType::DoubleArray(array))
     }
 }
 
-fn parse_i64_array_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
+fn parse_i64_array_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
 {
-    let (input, metadata) = parse_array_metadata(data)?;
+    let metadata = parse_array_metadata(reader)?;
     if metadata.encoding == 0 {
-        let (input, array) = count(le_i64, metadata.length as usize)(input)?;
-        Ok((input, PropertyRecordType::SignedInt64Array(array)))
-    }
-    else {
-        let (input, deflated_data) = take(metadata.compressed_length)(input)?;
-        let enflated_data = inflate::inflate_bytes_zlib(deflated_data).unwrap();
+        let mut array = vec![0i64; metadata.length as usize];
+        for _ in 0..metadata.length {
+            array.push(reader.read_i64::<LittleEndian>()?);
+        }
+        Ok(PropertyRecordType::SignedInt64Array(array))
+    } else {
+        let mut deflated_data = vec![0u8; metadata.compressed_length as usize];
+        reader.read_exact(&mut deflated_data);
+        let enflated_data = inflate::inflate_bytes_zlib(&deflated_data).unwrap();
         let length = enflated_data.len() / std::mem::size_of::<i64>();
 
         let mut array = Vec::with_capacity(length);
@@ -153,20 +174,23 @@ fn parse_i64_array_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
             array.push(enflated_data.as_slice().read_i64::<LittleEndian>().unwrap());
         }
 
-        Ok((input, PropertyRecordType::SignedInt64Array(array)))
+        Ok(PropertyRecordType::SignedInt64Array(array))
     }
 }
 
-fn parse_i32_array_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
+fn parse_i32_array_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
 {
-    let (input, metadata) = parse_array_metadata(data)?;
+    let metadata = parse_array_metadata(reader)?;
     if metadata.encoding == 0 {
-        let (input, array) = count(le_i32, metadata.length as usize)(input)?;
-        Ok((input, PropertyRecordType::SignedInt32Array(array)))
-    }
-    else {
-        let (input, deflated_data) = take(metadata.compressed_length)(input)?;
-        let enflated_data = inflate::inflate_bytes_zlib(deflated_data).unwrap();
+        let mut array = vec![0i32; metadata.length as usize];
+        for _ in 0..metadata.length {
+            array.push(reader.read_i32::<LittleEndian>()?);
+        }
+        Ok(PropertyRecordType::SignedInt32Array(array))
+    } else {
+        let mut deflated_data = vec![0u8; metadata.compressed_length as usize];
+        reader.read_exact(&mut deflated_data);
+        let enflated_data = inflate::inflate_bytes_zlib(&deflated_data).unwrap();
         let length = enflated_data.len() / std::mem::size_of::<i32>();
 
         let mut array = Vec::with_capacity(length);
@@ -174,20 +198,21 @@ fn parse_i32_array_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
             array.push(enflated_data.as_slice().read_i32::<LittleEndian>().unwrap());
         }
 
-        Ok((input, PropertyRecordType::SignedInt32Array(array)))
+        Ok(PropertyRecordType::SignedInt32Array(array))
     }
 }
 
-fn parse_bool_array_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
+fn parse_bool_array_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
 {
-    let (input, metadata) = parse_array_metadata(data)?;
+    let metadata = parse_array_metadata(reader)?;
     if metadata.encoding == 0 {
-        let (input, array) = count(le_i32, metadata.length as usize)(input)?;
-        Ok((input, PropertyRecordType::BooleanArray(array.iter().map(|x| *x == 1).collect())))
-    }
-    else {
-        let (input, deflated_data) = take(metadata.compressed_length)(input)?;
-        let enflated_data = inflate::inflate_bytes_zlib(deflated_data).unwrap();
+        let mut array = vec![0u8; metadata.length as usize];
+        reader.read_exact(&mut array);
+        Ok(PropertyRecordType::BooleanArray(array.iter().map(|x| *x == 1).collect()))
+    } else {
+        let mut deflated_data = vec![0u8; metadata.compressed_length as usize];
+        reader.read_exact(&mut deflated_data);
+        let enflated_data = inflate::inflate_bytes_zlib(&deflated_data).unwrap();
         let length = enflated_data.len() / std::mem::size_of::<i32>();
 
         let mut array = Vec::with_capacity(length);
@@ -195,89 +220,84 @@ fn parse_bool_array_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
             array.push(enflated_data.as_slice().read_u8().unwrap());
         }
 
-        Ok((input, PropertyRecordType::BooleanArray(array.iter().map(|x| *x == 1).collect())))
+        Ok(PropertyRecordType::BooleanArray(array.iter().map(|x| *x == 1).collect()))
     }
 }
 
-fn parse_string_property(data: &[u8]) -> Res<&[u8], PropertyRecordType> {
-    let (input, bytes) = length_data(le_u32)(data)?;
-    Ok((input, PropertyRecordType::String(String::from_utf8(Vec::from(bytes)).unwrap())))
+fn parse_string_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType> {
+    let length = reader.read_u32::<LittleEndian>()? as usize;
+    let mut bytes = vec![0u8; length];
+    reader.read_exact(&mut bytes);
+
+    Ok(PropertyRecordType::String(String::from_utf8(Vec::from(bytes)).unwrap()))
 }
 
-fn parse_binary_data_property(data: &[u8]) -> Res<&[u8], PropertyRecordType> {
-    let (input, bytes) = length_data(le_u32)(data)?;
-    Ok((input, PropertyRecordType::BinaryData(Vec::from(bytes))))
+fn parse_binary_data_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType> {
+    let length = reader.read_u32::<LittleEndian>()? as usize;
+    let mut bytes = vec![0u8; length];
+    reader.read_exact(&mut bytes);
+    Ok(PropertyRecordType::BinaryData(bytes))
 }
 
-fn parse_property(data: &[u8]) -> Res<&[u8], PropertyRecordType>
+fn parse_property(reader: &mut BufReader<File>) -> ParseResult<PropertyRecordType>
 {
-    let (input, type_code) = le_u8(data)?;
+    let type_code = reader.read_u8()?;
 
     match type_code as char {
-        'Y' => parse_i16_property(input),
-        'C' => parse_bool_property(data),
-        'I' => parse_i32_property(input),
-        'F' => parse_f32_property(input),
-        'D' => parse_f64_property(input),
-        'L' => parse_i64_property(input),
-        'f' => parse_f32_array_property(input),
-        'd' => parse_f64_array_property(input),
-        'l' => parse_i64_array_property(input),
-        'i' => parse_i32_array_property(input),
-        'b' => parse_bool_array_property(input),
-        'S' => parse_string_property(input),
-        'R' => parse_binary_data_property(input),
+        'Y' => parse_i16_property(reader),
+        'C' => parse_bool_property(reader),
+        'I' => parse_i32_property(reader),
+        'F' => parse_f32_property(reader),
+        'D' => parse_f64_property(reader),
+        'L' => parse_i64_property(reader),
+        'f' => parse_f32_array_property(reader),
+        'd' => parse_f64_array_property(reader),
+        'l' => parse_i64_array_property(reader),
+        'i' => parse_i32_array_property(reader),
+        'b' => parse_bool_array_property(reader),
+        'S' => parse_string_property(reader),
+        'R' => parse_binary_data_property(reader),
         _ => panic!("WOooo")
     }
 }
 
-fn parse_properties<C>(count: C) -> impl Fn(&[u8]) -> Res<&[u8], Vec<PropertyRecordType>>
-    where
-        C: ToUsize,
+fn parse_properties(reader: &mut BufReader<File>, num_properties: usize) -> ParseResult<Vec<PropertyRecordType>>
 {
-    let c = count.to_usize();
-    move |i: &[u8]| {
-        let mut result = Vec::new();
-        let mut input = i;
-        for _ in 0..c {
-            let (new_input, property) = parse_property(input)?;
-            result.push(property);
-            input = new_input;
-        }
-
-        Ok((input, result))
+    let mut result = Vec::new();
+    for _ in 0..num_properties {
+        let property = parse_property(reader)?;
+        result.push(property);
     }
+
+    Ok(result)
 }
 
-fn parse_string(data: &[u8]) -> Res<&[u8], &str> {
-    let (input, length) = le_u8(data)?;
-    let (input, string_bytes) = take(length)(input)?;
+fn parse_string(reader: &mut BufReader<File>) -> ParseResult<&str> {
+    let length = reader.read_u8()? as usize;
+    let mut string_bytes = vec![0u8; length];
+    reader.read_exact(&mut string_bytes);
 
-    let foo = std::str::from_utf8(string_bytes);
+    let foo = std::str::from_utf8(&string_bytes);
     if foo.is_err() {
         let ff = 23232;
     }
-    Ok((input, foo.unwrap()))
+    Ok(foo.unwrap())
 }
 
-fn parse_node(data: &[u8], start_offset: usize, file_length: usize) -> Res<&[u8], Option<NodeRecord>> {
-    let (input, end_offset) = le_u32(data)?;
-
+fn parse_node(reader: &mut BufReader<File>, start_offset: usize, file_length: usize) -> ParseResult<Option<NodeRecord>> {
+    let end_offset = reader.read_u32::<LittleEndian>()? as usize;
     if end_offset == 0 {
         // End of file
-        return Ok((input, None));
+        return Ok(None);
     }
 
-    if end_offset as usize >= file_length {
-        panic!("end offset is outside bounds");
+    if end_offset >= file_length {
+        return Err(ParseError::ValidationError("end offset is outside bounds"));
     }
 
-    let parse_num_props = le_u32;
-    let parse_prop_list_len = le_u32;
-    let parse_name = parse_string;
-
-    let (input, (num_properties, property_length_bytes, name))
-        = tuple((parse_num_props, parse_prop_list_len, parse_name))(input)?;
+    let num_properties = reader.read_u32::<LittleEndian>()?;
+    let property_length_bytes = reader.read_u32::<LittleEndian>()?;
+    let name = parse_string(reader)?;
 
     if name == "Geometry" {
         let sdss = 22;
@@ -290,85 +310,72 @@ fn parse_node(data: &[u8], start_offset: usize, file_length: usize) -> Res<&[u8]
         let sssss = 123;
     }
 
-    let property_start_offset = input.as_ptr() as usize;
+    let property_start_offset = reader.stream_position()? as usize;
     if property_start_offset + property_length_bytes as usize > file_length {
-        Error(nom::Err::Failure("property length out of bounds"));
+        return Err(ParseError::ValidationError("property length out of bounds"));
     }
 
-    let (mut input, properties) = parse_properties(num_properties as usize)(input)?;
+    let properties = parse_properties(reader,num_properties as usize)?;
 
-    if property_length_bytes as usize != input.as_ptr() as usize - property_start_offset {
-        Error(nom::Err::Failure("did not read correct amount of bytes when parsing properties."));
+    if property_length_bytes as usize != reader.stream_position()? as usize - property_start_offset {
+        return Err(ParseError::ValidationError("did not read correct amount of bytes when parsing properties"));
     }
 
     let mut child_nodes = Vec::new();
-    if get_offset(start_offset, input) < end_offset as usize {
-        let remaining_byte_count = end_offset as usize - get_offset(start_offset, input);
+    if (reader.stream_position()? as usize) < end_offset {
+        let remaining_byte_count = end_offset - reader.stream_position()? as usize;
         let sentinel_block_length = std::mem::size_of::<u32>() * 3 + 1;
         if remaining_byte_count < sentinel_block_length {
-            Error(nom::Err::Failure("insufficient amount of bytes at end of node"));
+            return Err(ParseError::ValidationError("insufficient amount of bytes at end of node"))
         }
 
-        while get_offset(start_offset, input) < end_offset as usize - sentinel_block_length {
-            let (new_input, node) = parse_node(input, start_offset, file_length)?;
+        while (reader.stream_position()? as usize) < end_offset - sentinel_block_length {
+            let node = parse_node(reader, start_offset, file_length)?;
             if node.is_some() {
                 child_nodes.push(node.expect("Null node?"));
             }
-
-            input = new_input;
         }
 
-        let (new_input, sentinel_block) = count(le_u8, sentinel_block_length)(input)?;
-        input = new_input;
+        let mut sentinel_block = vec![0u8; sentinel_block_length];
+        reader.read_exact(&mut sentinel_block);
         for i in 0..sentinel_block_length {
             if sentinel_block[i] != 0 {
-                Error(nom::Err::Failure("sentinel block contains non-zero values"));
+                return Err(ParseError::ValidationError("sentinel block contains non-zero values"));
             }
         }
-        //let (input, _) = parse_sentinel_block(input, sentinel_block_length)?;
-        // let (input, nested_list) = parse_nodes(input)?;
     }
 
-    if get_offset(start_offset, input)  != end_offset as usize {
-        Error(nom::Err::Failure("end offset not reached."));
+    if reader.stream_position()? as usize != end_offset {
+        return Err(ParseError::ValidationError("end offset not reached."));
     }
 
-    Ok((input, Some(NodeRecord {
-        end_offset,
-        property_list_len: property_length_bytes,
-        num_properties,
+    Ok(Some(NodeRecord {
         properties,
         nested_list: child_nodes,
         name: name.to_string(),
-    })))
+    }))
 }
 
 fn get_offset(start_offset: usize, end_offset: &[u8]) -> usize {
     end_offset.as_ptr() as usize - start_offset
 }
 
-fn magic_string(data: &[u8]) -> Res<&[u8], &str> {
-    context(
-        "header",
-        tag("Kaydara FBX Binary  \0"),
-    )(data).map(|(next_input, res)| (next_input, std::str::from_utf8(res).unwrap()))
-}
 
-fn header(data: &[u8]) -> Res<&[u8], Header> {
-    let unknown_byte_parser = take(2usize);
-    let version_parser = le_u32;
+fn header(reader: &mut BufReader<File>) -> ParseResult<Header> {
+    let mut magic_string = vec![0u8; 21];
+    reader.read_exact(&mut magic_string);
 
-    let mut combined = context("header", tuple((magic_string, unknown_byte_parser, version_parser)));
-    let (input, (magic, unknown_bytes, version)) = combined(data)?;
+    if std::str::from_utf8(&magic_string)? != "Kaydara FBX Binary  " {
+        return Err(ParseError::ValidationError("file header magic string is incorrect"))
+    }
 
-    Ok(
-        (input,
-         Header {
-             magic_string: magic,
-             unknown_bytes: [unknown_bytes[0], unknown_bytes[1]],
-             version,
-         })
-    )
+    // read and throw away two bytes
+    reader.read_u8();
+    reader.read_u8();
+
+    let version = reader.read_u32::<LittleEndian>()?;
+
+    Ok(Header { version })
 }
 
 fn print_property(prop: &PropertyRecordType, indent: usize) {
@@ -382,8 +389,8 @@ fn print_property(prop: &PropertyRecordType, indent: usize) {
         PropertyRecordType::SignedInt64(x) => { println!("i64: {}", x); }
         PropertyRecordType::FloatArray(x) => { println!("[f32]"); }
         PropertyRecordType::DoubleArray(x) => { println!("[f64]"); }
-        PropertyRecordType::SignedInt64Array(x) => { println!("[i64]");}
-        PropertyRecordType::SignedInt32Array(x) => { println!("[i32]");}
+        PropertyRecordType::SignedInt64Array(x) => { println!("[i64]"); }
+        PropertyRecordType::SignedInt32Array(x) => { println!("[i32]"); }
         PropertyRecordType::BooleanArray(x) => { println!("[bool]"); }
         PropertyRecordType::String(x) => { println!("str: {}", x); }
         PropertyRecordType::BinaryData(x) => { println!("raw"); }
@@ -402,36 +409,31 @@ fn print_node(node: &NodeRecord, indent: usize) {
     }
 }
 
-fn parse_nodes(data: &[u8], start_offset: usize, file_length: usize) -> Res<&[u8], Vec<NodeRecord>> {
-    let mut input = data;
+fn parse_nodes(reader: &mut BufReader<File>, start_offset: usize, file_length: usize) -> ParseResult<Vec<NodeRecord>> {
     let mut result = Vec::new();
-    let end = input.as_ptr() as usize + file_length;
-    while (input.as_ptr() as usize)  < end {
-        let (new_input, root) = parse_node(input, start_offset, file_length).unwrap();
-        input = new_input;
-
+    while (reader.stream_position()? as usize) < file_length {
+        let root = parse_node(reader, start_offset, file_length)?;
         if root.is_some() {
             result.push(root.unwrap());
         }
     }
 
-    Ok((input, result))
+    Ok(result)
 }
 
 fn main() {
     let mut file = File::open("/Users/emil/Downloads/untitled.fbx")
         .expect("Could not open file");
 
-    // let mut reader = BufReader::new(file);
-    let mut data = vec![];
-    file.read_to_end(&mut data).unwrap();
-    let (input, _header) = header(&data).unwrap();
+    let mut reader = BufReader::new(file);
+    let length = reader.stream_len().unwrap() as usize;
+    let header = header(&mut reader).unwrap();
 
-    let (input, nodes) =
+    let nodes =
         parse_nodes(
-            input,
-            data.as_ptr() as usize,
-            data.len()).unwrap();
+            &mut reader,
+            0,
+            length).unwrap();
 
     for node in &nodes {
         print_node(node, 0);
@@ -444,22 +446,4 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nom::error::{VerboseErrorKind, ErrorKind};
-
-    #[test]
-    fn magic_string_should_handle_happy_case() {
-        let input = "Kaydara FBX Binary  \0".as_bytes();
-        assert_eq!(magic_string(input), Ok(("".as_bytes(), "Kaydara FBX Binary  \0")));
-    }
-
-    #[test]
-    fn magic_string_should_fail_on_wrong_case() {
-        let input = "kaydara fbx BINARY  \0".as_bytes();
-        assert_eq!(magic_string(input), Err(nom::Err::Error(VerboseError {
-            errors: vec![
-                ("kaydara fbx BINARY  \0".as_bytes(), VerboseErrorKind::Nom(ErrorKind::Tag)),
-                ("kaydara fbx BINARY  \0".as_bytes(), VerboseErrorKind::Context("header"))
-            ]
-        })));
-    }
 }
