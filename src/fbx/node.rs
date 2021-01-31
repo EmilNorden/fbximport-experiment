@@ -2,11 +2,14 @@ use crate::fbx::{ParseError, ParseResult};
 use std::io::{Read, Seek};
 use byteorder::{ReadBytesExt, LittleEndian};
 use crate::fbx::property::{PropertyRecordType, parse_properties};
+use multimap::MultiMap;
+use crate::fbx::node_collection::NodeCollection;
 
+#[derive(Debug)]
 pub struct NodeRecord {
     pub(crate) name: String,
     pub(crate) properties: Vec<PropertyRecordType>,
-    pub(crate) nested_list: Vec<NodeRecord>,
+    pub(crate) children: NodeCollection,
 }
 
 fn parse_string(reader: &mut dyn Read) -> ParseResult<String> {
@@ -34,6 +37,10 @@ fn parse_node<R>(reader: &mut R, file_length: usize) -> ParseResult<Option<NodeR
     let property_length_bytes = reader.read_u32::<LittleEndian>()?;
     let name = parse_string(reader)?;
 
+    if name == "PolygonVertexIndex" {
+        let sdsds = 22;
+    }
+
     let property_start_offset = reader.stream_position()? as usize;
     if property_start_offset + property_length_bytes as usize > file_length {
         return Err(ParseError::ValidationError("property length out of bounds".to_string()));
@@ -44,7 +51,7 @@ fn parse_node<R>(reader: &mut R, file_length: usize) -> ParseResult<Option<NodeR
         return Err(ParseError::ValidationError("did not read correct amount of bytes when parsing properties".to_string()));
     }
 
-    let mut child_nodes = Vec::new();
+    let mut child_nodes = NodeCollection::new();
     if (reader.stream_position()? as usize) < end_offset {
         let remaining_byte_count = end_offset - reader.stream_position()? as usize;
         let sentinel_block_length = std::mem::size_of::<u32>() * 3 + 1;
@@ -53,9 +60,8 @@ fn parse_node<R>(reader: &mut R, file_length: usize) -> ParseResult<Option<NodeR
         }
 
         while (reader.stream_position()? as usize) < end_offset - sentinel_block_length {
-            let node = parse_node(reader, file_length)?;
-            if node.is_some() {
-                child_nodes.push(node.expect("Null node?"));
+            if let Some(node) = parse_node(reader, file_length)? {
+                child_nodes.insert(node);
             }
         }
 
@@ -74,20 +80,20 @@ fn parse_node<R>(reader: &mut R, file_length: usize) -> ParseResult<Option<NodeR
 
     Ok(Some(NodeRecord {
         properties,
-        nested_list: child_nodes,
+        children: child_nodes,
         name: name.to_string(),
     }))
 }
 
-pub(super) fn parse_nodes<R>(reader: &mut R, file_length: usize) -> ParseResult<Vec<NodeRecord>>
+pub(super) fn parse_nodes<R>(reader: &mut R, file_length: usize) -> ParseResult<NodeCollection>
     where
         R: Read + Seek
 {
-    let mut result = Vec::new();
+    let mut result = NodeCollection::new();
 
     while (reader.stream_position()? as usize) < file_length {
         match parse_node(reader, file_length)? {
-            Some(node) => result.push(node),
+            Some(node) => result.insert(node),
             None => break
         }
     }
