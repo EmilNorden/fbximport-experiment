@@ -37,7 +37,7 @@ fn parse_node<R>(reader: &mut R, file_length: usize) -> ParseResult<Option<NodeR
     let property_length_bytes = reader.read_u32::<LittleEndian>()?;
     let name = parse_string(reader)?;
 
-    if name == "PolygonVertexIndex" {
+    if name == "Vertices" {
         let sdsds = 22;
     }
 
